@@ -1,0 +1,5 @@
+dvcon_env/
+__pycache__/
+project.code-workspace/
+.gradio/
+*.pt
