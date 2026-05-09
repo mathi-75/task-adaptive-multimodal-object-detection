@@ -18,7 +18,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from PIL import Image
-from ultralytics import YOLO
+from ultralytics import YOLOWorld
 from transformers import CLIPProcessor, CLIPModel
 import requests
 from io import BytesIO
@@ -56,6 +56,25 @@ TASKS = {
     12: 'smear butter',
     13: 'extinguish fire',
     14: 'pound carpet'
+}
+
+# for each task, we tell YOLO-World exactly what objects to look for
+# this is the key advantage over standard YOLO — we can ask for anything by name
+TASK_CLASSES = {
+    'step on something':        ['stool', 'step stool', 'footstool', 'ladder', 'box', 'platform', 'chair'],
+    'sit comfortably':          ['chair', 'sofa', 'couch', 'armchair', 'bench', 'seat', 'recliner'],
+    'place flowers':            ['vase', 'pot', 'flower pot', 'jar', 'bowl', 'container', 'planter'],
+    'get potatoes out of fire': ['tongs', 'oven mitt', 'glove', 'fork', 'spatula', 'ladle', 'potato'],
+    'water plant':              ['watering can', 'hose', 'spray bottle', 'bucket', 'jug', 'pitcher'],
+    'get lemon out of tea':     ['spoon', 'teaspoon', 'tongs', 'fork', 'strainer', 'ladle'],
+    'dig hole':                 ['shovel', 'spade', 'trowel', 'pickaxe', 'hoe', 'garden fork'],
+    'open bottle of beer':      ['bottle opener', 'corkscrew', 'knife', 'lighter', 'key'],
+    'open parcel':              ['scissors', 'knife', 'box cutter', 'blade', 'cutter'],
+    'serve wine':               ['wine glass', 'glass', 'carafe', 'decanter', 'bottle', 'cup'],
+    'pour sugar':               ['sugar bowl', 'bowl', 'spoon', 'jar', 'dispenser', 'container'],
+    'smear butter':             ['knife', 'butter knife', 'spatula', 'spreader', 'spoon'],
+    'extinguish fire':          ['fire extinguisher', 'extinguisher', 'bucket', 'blanket', 'hose'],
+    'pound carpet':             ['broom', 'stick', 'carpet beater', 'paddle', 'brush', 'mop'],
 }
 
 # instead of using one prompt per task, we use 4 different ways to describe each task
@@ -186,9 +205,10 @@ def download_test_image():
 
 
 def load_models():
-    # loads YOLOv8n and CLIP — both download automatically on first run
-    print('Loading YOLOv8n...')
-    yolo = YOLO('yolov8n.pt')
+    # loads YOLO-World and CLIP — both download automatically on first run
+    # YOLO-World is the open-vocabulary version — it can detect any object by name
+    print('Loading YOLO-World (yolov8s-world.pt)...')
+    yolo = YOLOWorld('yolov8s-worldv2.pt')
 
     print('Loading CLIP...')
     clip = CLIPModel.from_pretrained('openai/clip-vit-base-patch32').to(DEVICE)
@@ -210,18 +230,22 @@ def load_image(source):
     return Image.open(source).convert('RGB')
 
 
-def detect_objects(image, yolo_model, conf_threshold=0.25):
-    # runs YOLO on the image and returns all detected objects with their crops
+def detect_objects(image, yolo_model, task_text, conf_threshold=0.10):
+    # tell YOLO-World what to look for based on the current task
+    # this is what makes it open-vocabulary — we set custom classes per task
+    classes = TASK_CLASSES.get(task_text, ['object'])
+    yolo_model.set_classes(classes)
+
     results = yolo_model(image, conf=conf_threshold, verbose=False)
     detections = []
 
     for result in results:
         for box in result.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            conf = float(box.conf[0])
+            conf  = float(box.conf[0])
             label = yolo_model.names[int(box.cls[0])]
 
-            # add a small padding around each crop so CLIP has better context
+            # small padding around each crop gives CLIP better context
             pad = 10
             w, h = image.size
             crop = image.crop((
@@ -283,7 +307,7 @@ def render_result(image, all_detections, ranked_detections, task_text, top_k=3):
     fig, ax = plt.subplots(1, 1, figsize=(12, 8))
     ax.imshow(image)
 
-    # all YOLO detections in grey dashed
+    # all detections in grey dashed
     for det in all_detections:
         x1, y1, x2, y2 = det['bbox']
         ax.add_patch(patches.Rectangle(
@@ -330,7 +354,8 @@ def render_result(image, all_detections, ranked_detections, task_text, top_k=3):
 def build_summary(all_detections, ranked_detections, task_text, input_filename, result_filename, top_k=3):
     lines = [
         f'Task: "{task_text}"',
-        f'Prompts used: {len(TASK_PROMPTS.get(task_text, [task_text]))} (ensemble averaged)',
+        f'YOLO-World classes searched: {TASK_CLASSES.get(task_text, [])}',
+        f'CLIP prompts used: {len(TASK_PROMPTS.get(task_text, [task_text]))} (ensemble averaged)',
         f'YOLO detections: {len(all_detections)}',
         f'Objects above threshold: {len(ranked_detections)}',
         f'Input saved  : images/{input_filename}',
@@ -363,16 +388,19 @@ def run_pipeline(input_image, task_label, clip_threshold, yolo_model, clip_model
     input_path, input_filename = save_input_image(input_image, task_text)
     image = load_image(input_path)
 
-    # run YOLO
-    detections = detect_objects(image, yolo_model)
+    # run YOLO-World with task-specific classes
+    detections = detect_objects(image, yolo_model, task_text)
     if not detections:
-        return image, 'YOLO found no objects in this image. Try a different image.'
+        return image, (
+            f'YOLO-World found none of these objects: {TASK_CLASSES.get(task_text, [])}\n'
+            'Try a different image or lower the threshold.'
+        )
 
     # run CLIP ensemble scoring
     detections = compute_clip_scores(detections, task_text, clip_model, processor)
     ranked     = filter_and_rank(detections, clip_threshold)
 
-    # render and save the result
+    # render and save result
     result_img = render_result(image, detections, ranked, task_text)
     _, result_filename = save_result_image(result_img, input_filename)
 
@@ -385,12 +413,12 @@ def build_gradio_ui(yolo_model, clip_model, processor):
     task_choices    = [f'Task {k}: {v}' for k, v in TASKS.items()]
     test_image_path = download_test_image()
 
-    with gr.Blocks(title='TAMOD — DVCon India 2026', theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title='TAMOD 2.0 — DVCon India 2026', theme=gr.themes.Soft()) as demo:
 
         gr.Markdown("""
-        # TAMOD — Task-Aware Object Detection
+        # TAMOD 2.0 — Task-Aware Object Detection
         ### DVCon India 2026 Design Contest | Stage 2A
-        **Pipeline:** YOLOv8n → CLIP Ensemble (4 prompts per task)
+        **Pipeline:** YOLO-World (open-vocabulary detection) → CLIP Ensemble (4 prompts per task)
 
         Upload an image, pick a task, hit Run. Input images go to `images/`, results go to `results/`.
         """)
@@ -404,7 +432,7 @@ def build_gradio_ui(yolo_model, clip_model, processor):
                     label='Select Task (1–14)'
                 )
                 threshold_slider = gr.Slider(
-                    minimum=0.10, maximum=0.50, value=0.20, step=0.01,
+                    minimum=0.05, maximum=0.50, value=0.20, step=0.01,
                     label='CLIP Similarity Threshold',
                     info='Lower = more results, Higher = stricter matching'
                 )
@@ -412,11 +440,11 @@ def build_gradio_ui(yolo_model, clip_model, processor):
 
             with gr.Column(scale=2):
                 output_image = gr.Image(label='Result (saved to results/)', type='pil', height=400)
-                output_text  = gr.Textbox(label='Summary', lines=12, interactive=False)
+                output_text  = gr.Textbox(label='Summary', lines=14, interactive=False)
 
         gr.Markdown("""
         ---
-        🟢 Green = best match &nbsp;|&nbsp; 🟡 Yellow = 2nd &nbsp;|&nbsp; 🟠 Orange = 3rd &nbsp;|&nbsp; ⬜ Grey dashed = all YOLO detections
+        🟢 Green = best match &nbsp;|&nbsp; 🟡 Yellow = 2nd &nbsp;|&nbsp; 🟠 Orange = 3rd &nbsp;|&nbsp; ⬜ Grey dashed = all YOLO-World detections
         """)
 
         gr.Examples(
